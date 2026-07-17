@@ -6,6 +6,7 @@ and extracts a small set of deterministic reimbursement field candidates.
 
 The tool never edits, renames, or moves source images. OCR output can contain
 sensitive reimbursement and payment data, so `runs/` is ignored by Git.
+Local source copies under `input/` are also ignored by Git.
 
 ## Setup
 
@@ -32,6 +33,9 @@ uv run hkclr-ocr scan "C:\path\to\screenshots" `
   --output .\runs\first `
   --profile auto
 ```
+
+For a self-contained local evaluation, copy a batch into `input/<batch-name>`
+and point `scan` at that directory. Do not commit the copied evidence.
 
 Useful options:
 
@@ -65,4 +69,3 @@ uv run python -m unittest discover -s tests -v
 passes a profile check when its required labels were recognized. Amounts and
 transaction identifiers should still be cross-checked against the reimbursement
 manifest before automation accepts evidence.
-
