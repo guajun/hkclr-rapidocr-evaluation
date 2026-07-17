@@ -29,6 +29,7 @@ class CoreTests(unittest.TestCase):
     def test_profile_inference(self) -> None:
         self.assertEqual(profile_for(Path("01_payment_record.png"), "auto"), "alipay")
         self.assertEqual(profile_for(Path("01_淘宝订单.png"), "auto"), "taobao")
+        self.assertEqual(profile_for(Path("物品/hqchip/01_order_panel.png"), "auto"), "generic")
         self.assertEqual(profile_for(Path("receipt.png"), "auto"), "generic")
 
     def test_discovers_supported_images_only(self) -> None:

@@ -71,11 +71,23 @@ def run_scan(
             errors += 1
         elif dry_run:
             row.update(status="dry_run")
-        elif object_path.exists() and not force:
-            cached = json.loads(object_path.read_text(encoding="utf-8"))
-            row.update(status="cached", extracted_fields=cached.get("extracted_fields", {}))
-            cache_hits += 1
         else:
+            cached = None
+            if object_path.exists() and not force:
+                try:
+                    cached = json.loads(object_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    cached = None
+
+            if cached is not None:
+                row.update(status="cached", extracted_fields=cached.get("extracted_fields", {}))
+                cache_hits += 1
+                check = row.get("extracted_fields", {}).get("profile_check")
+                if check:
+                    pass_counts[check] = pass_counts.get(check, 0) + 1
+                manifest_rows.append(row)
+                continue
+
             if engine is None:
                 raise RuntimeError("An OCR engine is required unless --dry-run is used")
             try:
@@ -142,4 +154,3 @@ def run_scan(
     }
     atomic_write_json(output / "ocr-summary.json", summary)
     return summary
-

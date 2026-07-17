@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Protocol
@@ -89,6 +91,8 @@ def compact_text(text: str) -> str:
 def profile_for(path: Path, requested: str) -> str:
     if requested != "auto":
         return requested
+    if "hqchip" in {part.casefold() for part in path.parts}:
+        return "generic"
     name = path.name.casefold()
     if any(token in name for token in ("alipay", "payment", "付款", "支付")):
         return "alipay"
@@ -129,6 +133,9 @@ def cache_key(record: ImageRecord, *, profile: str, min_score: float) -> str:
 
 def atomic_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
