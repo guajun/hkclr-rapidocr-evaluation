@@ -1,0 +1,10 @@
+"""Version identifiers shared by manifests, adapters, caches, and results."""
+
+JOB_MANIFEST_SCHEMA = "hkclr.rapidocr.job-manifest.v1"
+JOB_SCHEMA = "hkclr.rapidocr.job.v1"
+CONFIG_SCHEMA = "hkclr.rapidocr.config.v1"
+ADAPTER_SCHEMA = "hkclr.rapidocr.adapter.v1"
+RESULT_SCHEMA = "hkclr.rapidocr.result.v2"
+RUN_RECORD_SCHEMA = "hkclr.rapidocr.run-record.v2"
+SUMMARY_SCHEMA = "hkclr.rapidocr.summary.v2"
+ADAPTER_REGISTRY_VERSION = "business-evidence-v1"

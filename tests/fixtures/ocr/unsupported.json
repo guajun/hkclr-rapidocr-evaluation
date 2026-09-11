@@ -1,0 +1,7 @@
+{
+  "synthetic": true,
+  "lines": [
+    {"text": "UNCLASSIFIED SYNTHETIC PAGE", "score": 0.99, "box": [[10, 10], [300, 10], [300, 30], [10, 30]]},
+    {"text": "No known business layout", "score": 0.98, "box": [[10, 50], [250, 50], [250, 70], [10, 70]]}
+  ]
+}
