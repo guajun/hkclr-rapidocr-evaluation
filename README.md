@@ -133,6 +133,12 @@ Missing date or status rows require review. `pass` only means supported, complet
 extraction with no adapter warnings; consumers must still validate amounts,
 approval status, dates, and identifiers against their business records.
 
+Marketplace `order_date` is extracted from creation/order-time labels separately
+from `paid_date`. Payment on the following day must not be compared to the order
+creation date. Xianyu's default completeness check requires `order_id` and
+`amount`; payment method is optional because some order layouts do not show it.
+Explicit job `expected_fields` can require additional observations when needed.
+
 ## Tests
 
 The tests do not require ONNX Runtime or model initialization.

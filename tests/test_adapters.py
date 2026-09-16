@@ -107,6 +107,33 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result["fields"]["transaction_id"]["value"], "2099010100000000000000000000")
         self.assertEqual(len(result["fields"]["transaction_id"]["source_boxes"]), 2)
 
+    def test_merchant_order_date_and_payment_date_remain_distinct(self) -> None:
+        lines = fixture_lines("taobao_order")
+        lines.extend([
+            synthetic_line("创建时间", 10, 260),
+            synthetic_line("2026-10-0823:55:00", 200, 260, 220),
+            synthetic_line("付款时间", 10, 300),
+            synthetic_line("2026-10-09 00:05:00", 200, 300, 220),
+        ])
+        result = extract_fields(lines, "taobao")
+        self.assertEqual(result["fields"]["order_date"]["value"], "2026-10-08")
+        self.assertEqual(result["fields"]["paid_date"]["value"], "2026-10-09")
+        lines[-2:] = []
+        result = extract_fields(lines, "taobao")
+        self.assertNotIn("paid_date", result["fields"])
+
+    def test_xianyu_order_time_does_not_require_or_invent_payment_method(self) -> None:
+        lines = fixture_lines("xianyu_order")[:5]
+        lines.extend([
+            synthetic_line("下单时间", 10, 150),
+            synthetic_line("2026-10-1016:53:48", 200, 150, 220),
+        ])
+        result = extract_fields(lines, "xianyu")
+        self.assertEqual(result["profile_check"], "pass")
+        self.assertEqual(result["fields"]["order_date"]["value"], "2026-10-10")
+        self.assertNotIn("paid_date", result["fields"])
+        self.assertNotIn("payment_method", result["fields"])
+
     def test_approval_table_preserves_separate_ranges_and_detects_missing_rows(self) -> None:
         lines = [synthetic_line("Destination", 10, 10), synthetic_line('["Start Time","End Time"]', 220, 10, 220), synthetic_line("审批状态", 700, 10)]
         for y, start, end in ((70, "2026-10-01", "2026-10-03"), (150, "2026-10-06", "2026-10-07")):

@@ -539,7 +539,11 @@ def _commerce_fields(
     amount_labels: Iterable[str],
     trade_labels: Iterable[str],
     order_labels: Iterable[str] = (),
+    paid_date_labels: Iterable[str] = (
+        "支付时间", "付款时间", "Paid Date", "Payment Date",
+    ),
 ) -> ExtractorResult:
+    order_labels = tuple(order_labels)
     amount = _labeled_money(lines, amount_labels, context)
     fields: dict[str, Field | None] = {
         "amount": amount,
@@ -551,17 +555,20 @@ def _commerce_fields(
             lines, ("交易状态", "狀態", "状态", "Status"), _text_parser
         ),
         "paid_date": _labeled_field(
-            lines,
-            ("支付时间", "付款时间", "交易时间", "时间：", "Paid Date", "Payment Date"),
-            _date_from_text,
+            lines, paid_date_labels, _date_from_text,
         ),
+        "order_date": _labeled_field(
+            lines,
+            ("创建时间", "創建時間", "下单时间", "下單時間", "Order Date"),
+            _date_from_text,
+        ) if order_labels else None,
         "transaction_id": _trade_number(lines, trade_labels),
         "order_id": _labeled_field(
             lines,
             order_labels,
             _pattern_parser(re.compile(r"([A-Za-z0-9][A-Za-z0-9-]{5,})")),
         )
-        if tuple(order_labels)
+        if order_labels
         else None,
     }
     return (
@@ -609,6 +616,9 @@ def _alipay(lines: Lines, context: dict[str, Any]) -> ExtractorResult:
             "流水号",
             "流水號",
             "Transaction ID",
+        ),
+        paid_date_labels=(
+            "支付时间", "付款时间", "交易时间", "时间：", "Paid Date", "Payment Date",
         ),
     )
     if unit_line is not None and fields.get("currency", {}).get("value") == "CNY":
@@ -787,7 +797,7 @@ class ProfileAdapter:
     minimum_support_markers: int
     required_fields: tuple[str, ...]
     extractor: Extractor
-    version: str = "1.1.0"
+    version: str = "1.1.1"
 
     def support_matches(self, lines: Lines) -> list[str]:
         text = compact_text("\n".join(str(line.get("text", "")) for line in lines))
@@ -813,7 +823,7 @@ _ADAPTERS = (
         ("xianyu",),
         ("闲鱼", "閒魚", "xianyu", "成交金额"),
         1,
-        ("order_id", "amount", "payment_method"),
+        ("order_id", "amount"),
         _xianyu,
     ),
     ProfileAdapter(
