@@ -4,9 +4,12 @@ import json
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
+from hkclr_rapidocr_eval.adapters import PROFILE_ADAPTERS
 from hkclr_rapidocr_eval.jobs import load_job_manifest
 from hkclr_rapidocr_eval.runner import run_manifest, run_scan
 from hkclr_rapidocr_eval.schemas import (
@@ -26,11 +29,13 @@ class FakeEngine:
 
     def __init__(self, lines: list[dict[str, Any]]) -> None:
         self.lines = lines
+        self.calls = 0
 
     def recognize(
         self, path: Path, *, visualize_path: Path | None = None
     ) -> dict[str, Any]:
         del path, visualize_path
+        self.calls += 1
         return {
             "lines": self.lines,
             "elapsed_seconds": 0.01,
@@ -47,6 +52,37 @@ def travel_lines() -> list[dict[str, Any]]:
 
 
 class JobAndRunnerTests(unittest.TestCase):
+    def test_raw_cache_survives_adapter_changes_and_separates_engine_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "synthetic.pgm"
+            shutil.copyfile(FIXTURES / "a.PGM", image)
+            manifest_path = root / "jobs.json"
+            job = {
+                "schema": JOB_SCHEMA, "evidence_id": "synthetic-cached",
+                "source_path": str(image.resolve()), "requested_profile": "travel_approval",
+                "expected_fields": ["destination"],
+            }
+            def run(engine: FakeEngine, *, force: bool = False) -> dict:
+                manifest_path.write_text(json.dumps({"schema": JOB_MANIFEST_SCHEMA, "jobs": [job]}), encoding="utf-8")
+                return run_manifest(manifest_path=manifest_path, output=root / "output", min_score=0.5,
+                                    limit=None, force=force, visualize=False, dry_run=False, engine=engine)
+            engine = FakeEngine(travel_lines())
+            run(engine)
+            adapter = PROFILE_ADAPTERS["travel_approval"]
+            with patch.dict(PROFILE_ADAPTERS, {"travel_approval": replace(adapter, version="synthetic-next-version")}):
+                second = run(engine)
+            self.assertEqual(engine.calls, 1)
+            self.assertEqual(second["raw_cache_hits"], 1)
+            job["expected_fields"] = ["destination", "start_date"]
+            self.assertEqual(run(engine)["raw_cache_hits"], 1)
+            engine.model = "fixture-v2"
+            third = run(engine)
+            self.assertEqual(engine.calls, 2)
+            self.assertEqual(third["raw_cache_hits"], 0)
+            run(engine, force=True)
+            self.assertEqual(engine.calls, 3)
+
     def test_manifest_requires_absolute_source_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest_path = Path(temporary) / "jobs.json"
@@ -152,9 +188,10 @@ class JobAndRunnerTests(unittest.TestCase):
             source.mkdir()
             shutil.copyfile(FIXTURES / "a.PGM", source / "one.pgm")
             shutil.copyfile(FIXTURES / "a.PGM", source / "duplicate.pgm")
-            generated = source / "runs"
-            generated.mkdir()
-            shutil.copyfile(FIXTURES / "a.PGM", generated / "generated-copy.pgm")
+            for name in ("runs", "generated", "quarantine", "print-flat", "raw-objects", "_previous_payment_screenshots"):
+                generated = source / name
+                generated.mkdir()
+                shutil.copyfile(FIXTURES / "a.PGM", generated / "generated-copy.pgm")
 
             summary = run_scan(
                 source=source,
@@ -194,7 +231,8 @@ class JobAndRunnerTests(unittest.TestCase):
             )
             output = root / "private-output"
 
-            run_manifest(
+            engine = FakeEngine(travel_lines())
+            summary = run_manifest(
                 manifest_path=manifest_path,
                 output=output,
                 min_score=0.5,
@@ -202,8 +240,11 @@ class JobAndRunnerTests(unittest.TestCase):
                 force=False,
                 visualize=False,
                 dry_run=False,
-                engine=FakeEngine(travel_lines()),
+                engine=engine,
             )
+
+            self.assertEqual(engine.calls, 1)
+            self.assertEqual(summary["raw_cache_hits"], 1)
 
             results = [
                 json.loads(path.read_text(encoding="utf-8"))

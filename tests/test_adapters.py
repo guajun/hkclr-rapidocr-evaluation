@@ -16,7 +16,112 @@ def fixture_lines(name: str) -> list[dict[str, object]]:
     return payload["lines"]
 
 
+def synthetic_line(text: str, x: int, y: int, width: int = 100, height: int = 20) -> dict:
+    return {"text": text, "score": 0.99, "box": [x, y, x + width, y + height]}
+
+
 class AdapterTests(unittest.TestCase):
+    def test_bare_integer_fare_in_a_dated_row_is_not_dropped(self) -> None:
+        lines = fixture_lines("multi_ride")
+        lines[3]["text"] = "15"
+        result = extract_fields(lines, "ride_payment", business_context={"currency": "RMB"})
+        self.assertEqual(result["profile_check"], "pass")
+        self.assertEqual(result["candidate_totals"][0]["amount"], "42.75")
+        self.assertEqual(result["candidate_totals"][0]["component_count"], 2)
+
+    def test_times_dates_and_identifiers_cannot_fill_a_missing_fare(self) -> None:
+        for text in ("12:30", "20260802", "ID 1234", "2026", "1234567890123456789"):
+            with self.subTest(text=text):
+                lines = fixture_lines("multi_ride")
+                lines[3]["text"] = text
+                result = extract_fields(lines, "ride_payment", business_context={"currency": "CNY"})
+                self.assertEqual(result["profile_check"], "review")
+                self.assertEqual(len(result["transactions"]), 1)
+                self.assertTrue(any("Incomplete transaction coverage" in warning for warning in result["warnings"]))
+
+    def test_ride_cards_pair_fares_above_dates_and_parse_glued_times(self) -> None:
+        lines = [synthetic_line("呼叫返程", 10, 0)]
+        for offset, amount, timestamp in ((0, "15", "2026-10-0514:25"), (180, "¥16.20", "2026-10-0509:12")):
+            lines.extend([
+                synthetic_line(amount, 350, 50 + offset, 70),
+                synthetic_line("起点：示例起点", 10, 60 + offset, 200),
+                synthetic_line("终点：示例终点", 10, 90 + offset, 200),
+                synthetic_line("下单时间：" + timestamp, 10, 120 + offset, 200),
+            ])
+        result = extract_fields(lines, "ride_payment", business_context={"currency": "CNY"})
+        self.assertEqual(result["profile_check"], "pass")
+        self.assertEqual([row["date"]["value"] for row in result["transactions"]], ["2026-10-05"] * 2)
+        self.assertEqual(result["candidate_totals"][0]["amount"], "31.20")
+
+    def test_unassociated_second_fare_requires_review(self) -> None:
+        lines = fixture_lines("multi_ride")
+        lines[4]["text"] = "Unrecognized date"
+        result = extract_fields(lines, "ride_payment")
+        self.assertEqual(result["profile_check"], "review")
+        self.assertTrue(any("Unassociated" in warning for warning in result["warnings"]))
+
+    def test_explicit_transit_context_supports_headerless_layout_but_not_missing_sign(self) -> None:
+        lines = [synthetic_line("2026-10-0614:25", 10, 55, 180), synthetic_line("- 12", 310, 40, 70, 28)]
+        self.assertEqual(extract_fields(lines, "transit_payment")["profile_check"], "unsupported")
+        context = {"provider": "octopus", "currency": "HKD"}
+        result = extract_fields(lines, "transit_payment", business_context=context)
+        self.assertEqual(result["profile_check"], "pass")
+        self.assertEqual(result["candidate_totals"][0]["amount"], "-12.00")
+        lines[1]["text"] = "12"
+        result = extract_fields(lines, "transit_payment", business_context=context)
+        self.assertEqual(result["profile_check"], "review")
+        self.assertEqual(result["transactions"][0]["amount"]["value"], "12.00")
+
+    def test_alipay_paid_amount_has_priority_over_order_total(self) -> None:
+        lines = fixture_lines("alipay_payment")
+        lines[2]["text"] = "订单金额"
+        lines.extend([synthetic_line("实付金额", 500, 70), synthetic_line("58.20", 500, 105)])
+        result = extract_fields(lines, "alipay", business_context={"currency": "CNY"})
+        self.assertEqual(result["fields"]["amount"]["value"], "58.20")
+        lines[-1]["text"] = "Unreadable paid amount"
+        result = extract_fields(lines, "alipay", business_context={"currency": "CNY"})
+        self.assertEqual(result["profile_check"], "review")
+        self.assertNotIn("amount", result["fields"])
+
+    def test_labeled_money_preserves_negative_sign_and_integer_year_values(self) -> None:
+        for raw, expected in (("-2026", "-2026.00"), ("2026", "2026.00")):
+            lines = fixture_lines("alipay_payment")
+            lines[2]["text"] = "实付金额：" + raw
+            result = extract_fields(lines, "alipay", business_context={"currency": "CNY"})
+            self.assertEqual(result["fields"]["amount"]["value"], expected)
+
+    def test_xianyu_chinese_price_and_wrapped_trade_number(self) -> None:
+        lines = [
+            synthetic_line("闲鱼", 10, 0),
+            synthetic_line("成交价(已到达卖家账户)", 10, 50, 210),
+            synthetic_line("¥42.00", 350, 50),
+            synthetic_line("订单编号", 10, 100),
+            synthetic_line("SYN-ORDER-002", 250, 100, 200),
+            synthetic_line("支付宝交易号", 10, 150, 140),
+            synthetic_line("209901010000000000000", 200, 150, 210),
+            synthetic_line("0000000", 330, 180, 80),
+        ]
+        result = extract_fields(lines, "xianyu", expected_fields=["amount", "order_id", "transaction_id"])
+        self.assertEqual(result["profile_check"], "pass")
+        self.assertEqual(result["fields"]["amount"]["value"], "42.00")
+        self.assertEqual(result["fields"]["transaction_id"]["value"], "2099010100000000000000000000")
+        self.assertEqual(len(result["fields"]["transaction_id"]["source_boxes"]), 2)
+
+    def test_approval_table_preserves_separate_ranges_and_detects_missing_rows(self) -> None:
+        lines = [synthetic_line("Destination", 10, 10), synthetic_line('["Start Time","End Time"]', 220, 10, 220), synthetic_line("审批状态", 700, 10)]
+        for y, start, end in ((70, "2026-10-01", "2026-10-03"), (150, "2026-10-06", "2026-10-07")):
+            lines.extend([synthetic_line("示例城市", 10, y), synthetic_line(f'["{start} 上午","{end}', 220, y - 8, 300), synthetic_line("审批通过", 700, y)])
+        result = extract_fields(lines, "travel_approval", expected_fields=["approvals"])
+        self.assertEqual(result["profile_check"], "pass")
+        approvals = result["fields"]["approvals"]["value"]
+        self.assertEqual(len(approvals), 2)
+        self.assertEqual(approvals[1]["start_date"]["value"], "2026-10-06")
+        self.assertNotIn("start_date", result["fields"])
+        lines[7]["text"] = "Unrecognized interval"
+        result = extract_fields(lines, "travel_approval", expected_fields=["approvals"])
+        self.assertEqual(result["profile_check"], "review")
+        self.assertTrue(any("Incomplete approval coverage" in warning for warning in result["warnings"]))
+
     def test_registry_contains_every_business_profile(self) -> None:
         self.assertEqual(
             set(PROFILE_ADAPTERS),

@@ -30,6 +30,11 @@ DERIVED_DIRECTORY_NAMES = {
     ".venv",
     "__pycache__",
     "objects",
+    "raw-objects",
+    "generated",
+    "quarantine",
+    "print-flat",
+    "_previous_payment_screenshots",
     "runs",
     "visualizations",
 }
@@ -143,6 +148,7 @@ def cache_key(
     evidence_id: str | None = None,
     business_context: dict[str, Any] | None = None,
     expected_fields: tuple[str, ...] = (),
+    engine_identity: dict[str, Any] | None = None,
 ) -> str:
     normalized_profile = _adapters.normalize_profile(profile)
     adapter_versions = (
@@ -167,6 +173,7 @@ def cache_key(
         "minimum_score": round(min_score, 4),
         "business_context": business_context or {},
         "expected_fields": list(expected_fields),
+        "engine_identity": engine_identity or {},
     }
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")

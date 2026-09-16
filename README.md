@@ -39,7 +39,8 @@ The adapter registry supports `taobao_order_detail`, `xianyu_order_detail`,
 and `transit_payment`. The legacy `taobao` and `alipay` names remain aliases.
 Automatic selection uses both the filename and recognized layout markers.
 
-Generated `runs/`, `objects/`, and `visualizations/` directories are excluded
+Generated `runs/`, `objects/`, `raw-objects/`, `visualizations/`, `generated/`,
+`quarantine/`, `print-flat/`, and `_previous_payment_screenshots/` directories are excluded
 from recursive discovery. The summary reports `image_path_count` separately
 from content-addressed `unique_image_count`, so generated copies and duplicate
 source files cannot inflate unique-image coverage.
@@ -96,6 +97,7 @@ Useful options:
 Each run writes:
 
 - `objects/<cache-key>.ocr.json`: cached result for one evidence job and configuration.
+- `raw-objects/<cache-key>.ocr.json`: engine output shared across jobs and adapter versions.
 - `ocr-manifest.jsonl`: one record per source image in the current run.
 - `ocr-summary.json`: counts, timing, field coverage, and errors.
 - `visualizations/`: optional OCR overlays.
@@ -108,6 +110,28 @@ reported as `unsupported`; they are never counted as passes.
 
 The cache key includes the source hash, evidence id, all schema versions, adapter
 versions, requested profile, expected fields, business context, and minimum score.
+Engine output has its own content/engine cache key, so changing a profile,
+adapter, expected field list, or score threshold reuses recognized text. Engine
+name, model, and available runtime versions isolate incompatible caches. `--force`
+refreshes both levels; `raw_cache_hits` reports reuse separately from result hits.
+
+Ride adapters support dated table rows and repeated ride cards, including integer
+fares and OCR dates joined directly to a time. Unmatched dates, unmatched prices,
+ambiguous rows, and unknown currencies produce `review`, even when a partial sum
+exists. Transit adapters preserve observed signs; an unsigned price needs review
+because missing OCR punctuation cannot establish debit versus credit. For a
+headerless transit crop, an explicitly reviewed job may provide
+`{"provider": "mtr", "currency": "HKD"}` (or `provider: "octopus"`); the adapter
+still requires a dated transaction layout. Do not infer this context from color.
+
+Travel approval tables return `extracted_fields.approvals.value`, a list of rows
+containing typed `destination`, `start_date`, `end_date`, and `approval_status`
+fields. Request `expected_fields: ["approvals"]` for these jobs. Single-approval
+layouts also retain the original singular fields. Separate intervals remain
+separate; the adapter never treats the gaps between them as approved travel.
+Missing date or status rows require review. `pass` only means supported, complete
+extraction with no adapter warnings; consumers must still validate amounts,
+approval status, dates, and identifiers against their business records.
 
 ## Tests
 

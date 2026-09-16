@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import date as calendar_date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,8 @@ from .schemas import ADAPTER_REGISTRY_VERSION, ADAPTER_SCHEMA
 
 TRADE_NO_RE = re.compile(r"(?<!\d)20\d{26}(?!\d)")
 DATE_RE = re.compile(
-    r"(?<!\d)(20\d{2})\s*(?:[-/.年])\s*(\d{1,2})\s*(?:[-/.月])\s*(\d{1,2})\s*日?(?!\d)"
+    r"(?<!\d)(20\d{2})\s*(?:[-/.年])\s*(\d{1,2})\s*(?:[-/.月])\s*(\d{1,2})\s*日?"
+    r"(?=\d{2}:\d{2}|\D|$)"
 )
 AMOUNT_RE = re.compile(
     r"(?<![\dA-Za-z])"
@@ -107,7 +109,13 @@ def _normalize_date(match: re.Match[str]) -> str:
 
 def _date_from_text(text: str, line: dict[str, Any]) -> Field | None:
     match = DATE_RE.search(text)
-    return _field(_normalize_date(match), line, raw=match.group(0)) if match else None
+    if match is None:
+        return None
+    try:
+        calendar_date(*(int(value) for value in match.groups()))
+    except ValueError:
+        return None
+    return _field(_normalize_date(match), line, raw=match.group(0))
 
 
 def _currency_code(token: str | None) -> str | None:
@@ -139,7 +147,7 @@ def _money_from_match(
     currency = _currency_code(currency_token)
     currency_source = "ocr" if currency is not None else None
     if currency is None and isinstance(business_context.get("currency"), str):
-        currency = business_context["currency"].upper()
+        currency = _currency_code(business_context["currency"])
         currency_source = "business_context"
     result = _field(f"{amount:.2f}", line, raw=match.group(0).strip())
     result.update(
@@ -163,6 +171,13 @@ def _amounts_in_line(
             match.start() < end and match.end() > start for start, end in date_spans
         ):
             continue
+        # Do not turn times, partial decimals, date fragments or identifiers into
+        # money merely because a nearby label permits an unadorned number.
+        start, end = match.span()
+        if (start and text[start - 1] in ":/.") or (
+            end < len(text) and text[end] in ":/."
+        ):
+            continue
         number = match.group("number")
         if not (
             allow_plain
@@ -179,12 +194,37 @@ def _amounts_in_line(
     return results
 
 
+def _standalone_money(
+    text: str, line: dict[str, Any], context: dict[str, Any]
+) -> Field | None:
+    value = text.strip().replace("−", "-").replace("，", ",")
+    yuan_suffix = value.endswith("元")
+    if yuan_suffix:
+        value = value[:-1].strip()
+    match = AMOUNT_RE.fullmatch(value)
+    if match is None:
+        return None
+    number = match.group("number").replace(",", "")
+    if len(number.split(".")[0]) > 6:
+        return None
+    amount = _money_from_match(match, line, context)
+    if amount is not None and yuan_suffix and amount.get("currency") is None:
+        amount.update(currency="CNY", currency_token="元", currency_source="ocr")
+    return amount
+
+
 def _inline_suffix(text: str, label: str) -> str | None:
     start = text.casefold().find(label.casefold())
     if start < 0:
         return None
-    suffix = text[start + len(label) :].lstrip(" \t:：-—")
+    suffix = text[start + len(label) :].lstrip(" \t:：")
     return suffix or None
+
+
+def _contains_label(text: str, label: str) -> bool:
+    if label.isascii():
+        return re.search(r"(?<![A-Za-z])" + re.escape(label) + r"(?![A-Za-z])", text, re.IGNORECASE) is not None
+    return label.casefold() in text.casefold()
 
 
 def _nearby_lines(lines: Lines, label_index: int) -> list[dict[str, Any]]:
@@ -230,7 +270,7 @@ def _labeled_field(
     for index, line in enumerate(lines):
         text = str(line.get("text", ""))
         label = next(
-            (label for label in ordered_labels if label.casefold() in text.casefold()),
+            (label for label in ordered_labels if _contains_label(text, label)),
             None,
         )
         if label is None:
@@ -266,11 +306,14 @@ def _labeled_money(
     lines: Lines, labels: Iterable[str], business_context: dict[str, Any]
 ) -> Field | None:
     def parse(text: str, line: dict[str, Any]) -> Field | None:
-        synthetic_line = dict(line, text=text)
-        amounts = _amounts_in_line(synthetic_line, business_context, allow_plain=True)
-        return amounts[0] if amounts else None
+        return _standalone_money(text, line, business_context)
 
-    return _labeled_field(lines, labels, parse)
+    # The label order expresses semantic priority (paid amount before order
+    # total), irrespective of the engine's reading order across columns.
+    for label in labels:
+        if any(_contains_label(str(line.get("text", "")), label) for line in lines):
+            return _labeled_field(lines, (label,), parse)
+    return None
 
 
 def _trade_number(lines: Lines, labels: Iterable[str]) -> Field | None:
@@ -285,6 +328,33 @@ def _trade_number(lines: Lines, labels: Iterable[str]) -> Field | None:
         match = TRADE_NO_RE.search(str(line.get("text", "")))
         if match:
             return _field(match.group(0), line, raw=match.group(0))
+    # Phone screenshots wrap long trade numbers in the value column. Join only
+    # adjacent digit-only fragments beneath the labeled value, never arbitrary
+    # numbers elsewhere in the screenshot.
+    for label_index, label_line in enumerate(lines):
+        if not any(label in str(label_line.get("text", "")) for label in labels):
+            continue
+        for first in _nearby_lines(lines, label_index):
+            digits = str(first.get("text", "")).strip()
+            bounds = _bounds(first)
+            if not re.fullmatch(r"20\d{8,25}", digits) or bounds is None:
+                continue
+            continuations = []
+            for other in lines:
+                tail = str(other.get("text", "")).strip()
+                other_bounds = _bounds(other)
+                if other is first or other_bounds is None or not tail.isdigit():
+                    continue
+                gap = other_bounds[1] - bounds[3]
+                overlap = min(bounds[2], other_bounds[2]) - max(bounds[0], other_bounds[0])
+                if 0 <= gap <= (bounds[3] - bounds[1]) * 2 and overlap > 0:
+                    continuations.append((gap, tail, other))
+            for _, tail, other in sorted(continuations, key=lambda item: item[0]):
+                if TRADE_NO_RE.fullmatch(digits + tail):
+                    value = _field(digits + tail, first, raw=digits + "\n" + tail)
+                    value["confidence"] = min(_confidence(first), _confidence(other))
+                    value["source_boxes"] = [_box(first), _box(other)]
+                    return value
     return None
 
 
@@ -315,7 +385,7 @@ def _candidate_totals_from_amount(amount: Field | None) -> list[dict[str, Any]]:
 
 def _transaction_rows(
     lines: Lines, business_context: dict[str, Any]
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     dates: list[tuple[int, Field]] = []
     amounts: list[tuple[int, Field]] = []
     for index, line in enumerate(lines):
@@ -325,12 +395,26 @@ def _transaction_rows(
         if not any(
             marker in str(line.get("text", "")).casefold() for marker in TOTAL_MARKERS
         ):
-            amounts.extend(
-                (index, amount) for amount in _amounts_in_line(line, business_context)
-            )
+            amount = _standalone_money(str(line.get("text", "")), line, business_context)
+            if amount is not None and not amount.get("currency_token") and re.fullmatch(
+                r"(?:19|20)\d{2}", str(line.get("text", "")).strip()
+            ):
+                amount = None
+            if amount is not None:
+                amounts.append((index, amount))
+            elif date is not None:
+                # Some engines put the date and an explicitly marked price in
+                # one box; standalone integers need a separate spatial column.
+                amounts.extend(
+                    (index, amount)
+                    for amount in _amounts_in_line(line, business_context)
+                    if amount.get("currency_token")
+                )
 
     rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
     used_amounts: set[int] = set()
+    ride_cards = any("下单时间" in str(line.get("text", "")) for line in lines)
     for date_index, date in dates:
         ranked: list[tuple[float, int, Field]] = []
         date_bounds = _bounds(lines[date_index])
@@ -350,10 +434,29 @@ def _transaction_rows(
                 amount_bounds[3] - amount_bounds[1],
                 1.0,
             )
+            if amount_bounds[3] - amount_bounds[1] < (date_bounds[3] - date_bounds[1]) * 0.6:
+                continue
             distance = abs(date_center - amount_center)
-            if distance <= row_height * 0.8:
+            if distance <= row_height * 0.8 and amount_bounds[0] >= date_bounds[2] - 3:
                 ranked.append((distance, amount_position, amount))
+            elif ride_cards and "下单时间" in str(lines[date_index].get("text", "")):
+                # Ride fares precede the order date vertically. The previous
+                # card bounds this search so neighboring fares cannot leak in.
+                previous_bottom = max(
+                    (bounds[3] for index, _ in dates if index != date_index
+                     if (bounds := _bounds(lines[index])) is not None
+                     and bounds[3] < date_bounds[1]),
+                    default=0.0,
+                )
+                if (amount_bounds[0] >= date_bounds[2] - 3
+                    and previous_bottom <= amount_bounds[1] < date_bounds[1]
+                    and date_bounds[1] - amount_bounds[3] <= row_height * 5):
+                    ranked.append((distance, amount_position, amount))
         if not ranked:
+            warnings.append(f"Transaction date {date['value']} has no associated amount")
+            continue
+        if len(ranked) > 1:
+            warnings.append(f"Transaction date {date['value']} has ambiguous amount candidates")
             continue
         _, amount_position, amount = min(ranked, key=lambda item: item[0])
         used_amounts.add(amount_position)
@@ -388,7 +491,21 @@ def _transaction_rows(
                 "source_boxes": source_boxes,
             }
         )
-    return rows
+    if dates and len(rows) != len(dates):
+        warnings.append(f"Incomplete transaction coverage: {len(rows)} of {len(dates)} dated rows")
+    dated_bounds = [_bounds(lines[index]) for index, _ in dates]
+    dated_bounds = [bounds for bounds in dated_bounds if bounds is not None]
+    if dated_bounds:
+        minimum_right = min(bounds[2] for bounds in dated_bounds)
+        minimum_height = min(bounds[3] - bounds[1] for bounds in dated_bounds)
+        unmatched = [position for position, (index, _) in enumerate(amounts)
+                     if position not in used_amounts
+                     if (bounds := _bounds(lines[index])) is not None
+                     and bounds[0] >= minimum_right - 3
+                     and bounds[3] - bounds[1] >= minimum_height * 0.6]
+        if unmatched:
+            warnings.append(f"Unassociated transaction amount candidates: {len(unmatched)}")
+    return rows, warnings
 
 
 def _transaction_totals(transactions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -435,7 +552,7 @@ def _commerce_fields(
         ),
         "paid_date": _labeled_field(
             lines,
-            ("支付时间", "付款时间", "交易时间", "Paid Date", "Payment Date"),
+            ("支付时间", "付款时间", "交易时间", "时间：", "Paid Date", "Payment Date"),
             _date_from_text,
         ),
         "transaction_id": _trade_number(lines, trade_labels),
@@ -469,14 +586,20 @@ def _xianyu(lines: Lines, context: dict[str, Any]) -> ExtractorResult:
     return _commerce_fields(
         lines,
         context,
-        amount_labels=("实付款", "實付款", "成交金额", "成交金額", "Amount Paid"),
+        amount_labels=("实付款", "實付款", "成交金额", "成交金額", "成交价", "成交價", "Amount Paid"),
         trade_labels=("支付宝交易号", "支付寶交易號", "Transaction ID"),
-        order_labels=("订单号", "訂單號", "Order ID"),
+        order_labels=("订单编号", "訂單編號", "订单号", "訂單號", "Order ID"),
     )
 
 
 def _alipay(lines: Lines, context: dict[str, Any]) -> ExtractorResult:
-    return _commerce_fields(
+    context = dict(context)
+    unit_line = next((line for line in lines if re.search(
+        r"单位\s*[:：]\s*元", str(line.get("text", ""))
+    )), None)
+    if "currency" not in context and unit_line is not None:
+        context["currency"] = "CNY"
+    fields, transactions, totals, warnings = _commerce_fields(
         lines,
         context,
         amount_labels=("实付金额", "實付金額", "订单金额", "訂單金額", "Amount"),
@@ -488,6 +611,10 @@ def _alipay(lines: Lines, context: dict[str, Any]) -> ExtractorResult:
             "Transaction ID",
         ),
     )
+    if unit_line is not None and fields.get("currency", {}).get("value") == "CNY":
+        fields["currency"] = dict(_field("CNY", unit_line), source="ocr")
+        fields["amount"]["currency_source"] = "ocr"
+    return fields, transactions, totals, warnings
 
 
 def _vendor_receipt(lines: Lines, context: dict[str, Any]) -> ExtractorResult:
@@ -521,44 +648,135 @@ def _vendor_receipt(lines: Lines, context: dict[str, Any]) -> ExtractorResult:
 
 def _travel_approval(lines: Lines, context: dict[str, Any]) -> ExtractorResult:
     del context
+    table = _approval_table(lines)
+    if table is not None:
+        approvals, warnings = table
+        return {"approvals": _approval_list_field(approvals)}, [], [], warnings
     fields: dict[str, Field | None] = {
         "destination": _labeled_field(
             lines, ("Destination", "出差地点", "出差地點", "目的地"), _text_parser
         ),
         "start_date": _labeled_field(
             lines,
-            ("Start Date", "Departure Date", "开始日期", "開始日期", "出发日期"),
+            ("Start Date", "Start Time", "Departure Date", "开始日期", "開始日期", "出发日期"),
             _date_from_text,
         ),
         "end_date": _labeled_field(
             lines,
-            ("End Date", "Return Date", "结束日期", "結束日期", "返回日期"),
+            ("End Date", "End Time", "Return Date", "结束日期", "結束日期", "返回日期"),
             _date_from_text,
         ),
         "approval_status": _labeled_field(
             lines, ("Approval Status", "审批状态", "審批狀態"), _text_parser
         ),
     }
+    present = {name: value for name, value in fields.items() if value is not None}
+    if len(present) == 4:
+        present["approvals"] = _approval_list_field([dict(present)])
     return (
-        {name: value for name, value in fields.items() if value is not None},
+        present,
         [],
         [],
         [],
     )
 
 
+def _approval_list_field(approvals: list[dict[str, Field]]) -> Field:
+    return {
+        "value": approvals,
+        "confidence": min(
+            (field["confidence"] for row in approvals for field in row.values()),
+            default=0.0,
+        ),
+        "source_box": None,
+    }
+
+
+def _approval_table(lines: Lines) -> tuple[list[dict[str, Field]], list[str]] | None:
+    headers = {}
+    for line in lines:
+        text = compact_text(str(line.get("text", "")))
+        if "destination" in text or text in {"目的地", "出差地点", "出差地點"}:
+            headers["destination"] = line
+        if "starttime" in text and "endtime" in text:
+            headers["dates"] = line
+        if text in {"审批状态", "審批狀態", "approvalstatus"}:
+            headers["approval_status"] = line
+    if set(headers) != {"destination", "dates", "approval_status"}:
+        return None
+    header_bounds = {name: _bounds(line) for name, line in headers.items()}
+    if any(bounds is None for bounds in header_bounds.values()):
+        return None
+    rows = []
+    warnings = []
+    dates_bounds = header_bounds["dates"]
+    for line in lines:
+        bounds = _bounds(line)
+        if bounds is None or bounds[1] <= dates_bounds[3]:
+            continue
+        if min(bounds[2], dates_bounds[2]) <= max(bounds[0], dates_bounds[0]):
+            continue
+        matches = list(DATE_RE.finditer(str(line.get("text", ""))))
+        if not matches:
+            continue
+        if len(matches) != 2 or any(_date_from_text(m.group(0), line) is None for m in matches):
+            warnings.append("Approval table date interval is incomplete or ambiguous")
+            continue
+        row = {
+            "start_date": _field(_normalize_date(matches[0]), line, raw=matches[0].group(0)),
+            "end_date": _field(_normalize_date(matches[1]), line, raw=matches[1].group(0)),
+        }
+        for name in ("destination", "approval_status"):
+            column = header_bounds[name]
+            candidates = []
+            for other in lines:
+                other_bounds = _bounds(other)
+                if other_bounds is None or other_bounds[1] <= column[3]:
+                    continue
+                overlap = min(column[2], other_bounds[2]) - max(column[0], other_bounds[0])
+                distance = abs((bounds[1] + bounds[3] - other_bounds[1] - other_bounds[3]) / 2)
+                height = max(bounds[3] - bounds[1], other_bounds[3] - other_bounds[1])
+                if overlap > 0 and distance <= height:
+                    candidates.append(other)
+            if len(candidates) == 1:
+                row[name] = _field(str(candidates[0]["text"]).strip(), candidates[0])
+            else:
+                warnings.append(f"Approval table row has missing or ambiguous {name}")
+        if len(row) == 4:
+            if row["start_date"]["value"] > row["end_date"]["value"]:
+                warnings.append("Approval date interval ends before it starts")
+            rows.append(row)
+    if not rows:
+        warnings.append("No complete approval rows were extracted")
+    status_column = header_bounds["approval_status"]
+    status_count = sum(
+        1 for line in lines if (bounds := _bounds(line)) is not None
+        and bounds[1] > status_column[3]
+        and min(status_column[2], bounds[2]) > max(status_column[0], bounds[0])
+    )
+    if status_count != len(rows):
+        warnings.append(f"Incomplete approval coverage: {len(rows)} of {status_count} status rows")
+    return rows, warnings
+
+
 def _ride_or_transit(lines: Lines, context: dict[str, Any]) -> ExtractorResult:
-    transactions = _transaction_rows(lines, context)
+    transactions, warnings = _transaction_rows(lines, context)
     fields: dict[str, Field] = {}
-    warnings: list[str] = []
     if any(
-        transaction["amount"].get("currency_token") == "$"
+        transaction["amount"].get("currency") is None
         for transaction in transactions
     ):
         warnings.append(
-            "A bare $ currency symbol is ambiguous; provide business_context.currency"
+            "Transaction currency is unknown; provide business_context.currency"
         )
     return fields, transactions, _transaction_totals(transactions), warnings
+
+
+def _transit(lines: Lines, context: dict[str, Any]) -> ExtractorResult:
+    fields, transactions, totals, warnings = _ride_or_transit(lines, context)
+    if any(row["amount"].get("explicit_sign") is None for row in transactions):
+        warnings.append("Transit amount has no explicit debit/credit sign; verify payment direction")
+    return fields, transactions, totals, warnings
 
 
 @dataclass(frozen=True)
@@ -569,7 +787,7 @@ class ProfileAdapter:
     minimum_support_markers: int
     required_fields: tuple[str, ...]
     extractor: Extractor
-    version: str = "1.0.0"
+    version: str = "1.1.0"
 
     def support_matches(self, lines: Lines) -> list[str]:
         text = compact_text("\n".join(str(line.get("text", "")) for line in lines))
@@ -619,13 +837,13 @@ _ADAPTERS = (
         ("travel",),
         ("travelapproval", "出差申请", "出差申請", "审批状态", "審批狀態"),
         1,
-        ("destination", "start_date", "end_date", "approval_status"),
+        ("approvals",),
         _travel_approval,
     ),
     ProfileAdapter(
         "ride_payment",
         ("didi", "ride"),
-        ("didi", "滴滴", "ridehistory", "行程记录", "行程記錄", "打车"),
+        ("didi", "滴滴", "ridehistory", "行程记录", "行程記錄", "打车", "呼叫返程", "再来一单"),
         1,
         ("transactions", "candidate_totals"),
         _ride_or_transit,
@@ -636,7 +854,7 @@ _ADAPTERS = (
         ("mtr", "港铁", "港鐵", "transit", "地铁", "地鐵"),
         1,
         ("transactions", "candidate_totals"),
-        _ride_or_transit,
+        _transit,
     ),
 )
 
@@ -725,7 +943,14 @@ def extract_fields(
 
     adapter = PROFILE_ADAPTERS[resolved]
     matches = adapter.support_matches(line_list)
-    if not adapter.supports(line_list):
+    trusted_transit = (
+        requested == "transit_payment"
+        and str(context.get("provider", "")).casefold() in {"mtr", "octopus"}
+        and any(_date_from_text(str(line.get("text", "")), line) for line in line_list)
+    )
+    if trusted_transit:
+        matches.append("business_context.provider=" + str(context["provider"]).casefold())
+    if not adapter.supports(line_list) and not trusted_transit:
         return {
             "profile": resolved,
             "adapter": {
@@ -747,7 +972,7 @@ def extract_fields(
 
     fields, transactions, totals, warnings = adapter.extractor(line_list, context)
     expected = tuple(expected_fields or adapter.required_fields)
-    present = set(fields)
+    present = {name for name, field in fields.items() if field.get("value") not in (None, [], "")}
     if transactions:
         present.add("transactions")
     if totals:
@@ -772,5 +997,5 @@ def extract_fields(
         "warnings": warnings,
         "expected_fields": list(expected),
         "missing_expected_fields": missing,
-        "profile_check": "pass" if not missing else "review",
+        "profile_check": "pass" if not missing and not warnings else "review",
     }
