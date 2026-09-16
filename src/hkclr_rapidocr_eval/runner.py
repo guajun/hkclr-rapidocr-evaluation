@@ -28,6 +28,40 @@ from .schemas import (
     SUMMARY_SCHEMA,
 )
 
+RAW_CACHE_SCHEMA = "hkclr.rapidocr.raw-cache.v1"
+
+
+def _engine_identity(engine: OCREngine | None) -> dict[str, Any]:
+    if engine is None:
+        return {}
+    return dict(getattr(engine, "cache_identity", {"name": engine.name, "model": engine.model}))
+
+
+def _raw_cache_key(source_sha256: str, identity: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        {"schema": RAW_CACHE_SCHEMA, "source_sha256": source_sha256, "engine": identity},
+        sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _load_raw_cache(path: Path, source_sha256: str, identity: dict[str, Any]) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (payload.get("schema") != RAW_CACHE_SCHEMA
+            or payload.get("source_sha256") != source_sha256
+            or payload.get("engine") != identity):
+            return None
+        raw = payload["raw"]
+        if not isinstance(raw.get("lines"), list):
+            return None
+        if not all(isinstance(line, dict) and isinstance(line.get("text"), str)
+                   and isinstance(line.get("score"), (int, float)) for line in raw["lines"]):
+            return None
+        return raw
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -84,8 +118,10 @@ def _run_jobs(
     manifest_rows: list[dict[str, Any]] = []
     unique_hashes: set[str] = set()
     cache_hits = 0
+    raw_cache_hits = 0
     errors = 0
     total_elapsed = 0.0
+    identity = _engine_identity(engine)
 
     for index, job in enumerate(selected_jobs, 1):
         path = job.source_path.resolve()
@@ -114,6 +150,7 @@ def _run_jobs(
             evidence_id=job.evidence_id,
             business_context=job.business_context,
             expected_fields=job.expected_fields,
+            engine_identity=identity,
         )
         object_path = output / "objects" / f"{key}.ocr.json"
         row: dict[str, Any] = {
@@ -151,7 +188,9 @@ def _run_jobs(
                 try:
                     candidate = json.loads(object_path.read_text(encoding="utf-8"))
                     cached = (
-                        candidate if candidate.get("schema") == RESULT_SCHEMA else None
+                        candidate if isinstance(candidate, dict)
+                        and candidate.get("schema") == RESULT_SCHEMA
+                        and isinstance(candidate.get("source"), dict) else None
                     )
                 except (OSError, json.JSONDecodeError):
                     cached = None
@@ -173,10 +212,23 @@ def _run_jobs(
             if engine is None:
                 raise RuntimeError("An OCR engine is required unless --dry-run is used")
             try:
+                raw_key = _raw_cache_key(image.sha256, identity)
+                raw_path = output / "raw-objects" / f"{raw_key}.ocr.json"
                 visual_path = (
-                    output / "visualizations" / f"{key}.jpg" if visualize else None
+                    output / "visualizations" / f"{raw_key}.jpg" if visualize else None
                 )
-                raw = engine.recognize(path, visualize_path=visual_path)
+                raw = None if force else _load_raw_cache(raw_path, image.sha256, identity)
+                if visualize and visual_path is not None and not visual_path.exists():
+                    raw = None
+                raw_cached = raw is not None
+                if raw is None:
+                    raw = engine.recognize(path, visualize_path=visual_path)
+                    atomic_write_json(raw_path, {
+                        "schema": RAW_CACHE_SCHEMA, "source_sha256": image.sha256,
+                        "engine": identity, "created_at": _now(), "raw": raw,
+                    })
+                else:
+                    raw_cache_hits += 1
                 lines = [
                     line for line in raw["lines"] if float(line["score"]) >= min_score
                 ]
@@ -188,7 +240,7 @@ def _run_jobs(
                     expected_fields=job.expected_fields,
                 )
                 elapsed = raw.get("elapsed_seconds")
-                if elapsed is not None:
+                if elapsed is not None and not raw_cached:
                     total_elapsed += float(elapsed)
                 payload = {
                     "schema": RESULT_SCHEMA,
@@ -213,6 +265,8 @@ def _run_jobs(
                         "elapsed_seconds": elapsed,
                         "stage_elapsed_seconds": raw.get("stage_elapsed_seconds", []),
                         "language": raw.get("language"),
+                        "raw_cache_hit": raw_cached,
+                        "raw_cache_key": raw_key,
                     },
                     "profile_support": {
                         "requested": job.requested_profile,
@@ -283,6 +337,7 @@ def _run_jobs(
         "images_discovered": len(selected_jobs),
         "processed": sum(row["status"] == "ok" for row in manifest_rows),
         "cache_hits": cache_hits,
+        "raw_cache_hits": raw_cache_hits,
         "errors": errors,
         "profiles": profile_counts,
         "profile_support": support_counts,

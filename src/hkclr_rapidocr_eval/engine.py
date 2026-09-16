@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,12 @@ class RapidOCREngine:
                 "RapidOCR could not initialize an inference runtime. "
                 "For CPU inference run: uv sync --extra onnx"
             ) from error
+        self.cache_identity = {"name": self.name, "model": self.model}
+        for package in ("rapidocr", "onnxruntime"):
+            try:
+                self.cache_identity[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                self.cache_identity[package] = None
 
     def recognize(self, path: Path, *, visualize_path: Path | None = None) -> dict[str, Any]:
         result = self._engine(str(path))
